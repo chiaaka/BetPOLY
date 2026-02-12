@@ -20,6 +20,13 @@ from decimal import Decimal, ROUND_DOWN
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
+
+# Log py-clob-client version on import
+try:
+    import py_clob_client as _pcc
+    _pcc_version = getattr(_pcc, '__version__', 'unknown')
+except Exception:
+    _pcc_version = 'unknown'
 from web3 import Web3
 from config import POLYGON_RPC_URL
 
@@ -520,24 +527,59 @@ async def place_bet(
             tick_size=tick_size,
         )
         
-        logger.info(f"  Posting FOK order: shares={shares} price={price} amount~${order_cost} neg_risk={neg_risk} tick_size={tick_size}")
+        logger.info(f"  py-clob-client version: {_pcc_version}")
+        logger.info(f"  Posting order: shares={shares} price={price} amount~${order_cost} neg_risk={neg_risk} tick_size={tick_size}")
         
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=shares,
-            side=BUY,
-        )
+        response = None
         
+        # Strategy 1: MarketOrderArgs (true market order, like Polymarket website)
+        # Requires py-clob-client >= 0.34.5 where MarketOrderArgs accepts 'side'
         try:
-            # Primary: FOK order (immediate fill, should bypass min_order_size for resting orders)
-            signed_order = client.create_order(order_args, options=options)
+            from py_clob_client.clob_types import MarketOrderArgs
+            market_order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=order_cost,
+                side=BUY,
+                order_type=OrderType.FOK,
+            )
+            logger.info(f"  Strategy 1: MarketOrderArgs(amount=${order_cost}, side=BUY, FOK)")
+            signed_order = client.create_market_order(market_order_args, options=options)
             response = client.post_order(signed_order, OrderType.FOK)
-        except Exception as fok_err:
-            fok_str = str(fok_err)
-            logger.warning(f"  FOK order failed: {fok_str[:150]}")
-            
-            # Fallback: GTC limit order (may hit min_order_size)
+            logger.info(f"  Strategy 1 succeeded")
+        except TypeError as te:
+            logger.warning(f"  Strategy 1 failed (TypeError): {te}")
+            # MarketOrderArgs doesn't accept 'side' in this version
+            # Try without options
+            try:
+                signed_order = client.create_market_order(market_order_args)
+                response = client.post_order(signed_order, OrderType.FOK)
+                logger.info(f"  Strategy 1b succeeded (no options)")
+            except Exception as e1b:
+                logger.warning(f"  Strategy 1b failed: {str(e1b)[:150]}")
+                response = None
+        except Exception as e1:
+            logger.warning(f"  Strategy 1 failed: {str(e1)[:150]}")
+            response = None
+        
+        # Strategy 2: FOK limit order (marketable limit = market order)
+        if not response or not response.get("orderID"):
+            try:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=shares,
+                    side=BUY,
+                )
+                logger.info(f"  Strategy 2: FOK limit order (shares={shares}, price={price})")
+                signed_order = client.create_order(order_args, options=options)
+                response = client.post_order(signed_order, OrderType.FOK)
+                logger.info(f"  Strategy 2 succeeded")
+            except Exception as e2:
+                logger.warning(f"  Strategy 2 failed: {str(e2)[:150]}")
+                response = None
+        
+        # Strategy 3: GTC limit order (last resort, requires min_order_size)
+        if not response or not response.get("orderID"):
             if shares < min_size:
                 shares = min_size
                 clob_cost_micro = math.floor(shares * calc_price * 1_000_000)
@@ -547,15 +589,15 @@ async def place_bet(
                     result["error"] = (f"Minimum bet for this market is {min_size:.0f} shares "
                                       f"(${total_needed:.2f} needed). You have ${balance:.2f}.")
                     return result
-                logger.info(f"  Fallback GTC: adjusted to min shares={shares}, cost=${order_cost}")
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=price,
-                    size=shares,
-                    side=BUY,
-                )
+                logger.info(f"  Strategy 3: GTC adjusted to min shares={shares}, cost=${order_cost}")
             
-            logger.info(f"  Fallback: posting GTC limit order: shares={shares} price={price}")
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side=BUY,
+            )
+            logger.info(f"  Strategy 3: GTC limit order (shares={shares}, price={price})")
             response = client.create_and_post_order(order_args, options=options)
         
         if response and response.get("orderID"):
