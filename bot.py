@@ -1,3 +1,16 @@
+# TEMPORARY - remove after checking logs
+try:
+    import py_builder_relayer_client as pkg
+    import os
+    pkg_dir = os.path.dirname(pkg.__file__)
+    for f in sorted(os.listdir(pkg_dir)):
+        if f.endswith('.py'):
+            with open(os.path.join(pkg_dir, f)) as fp:
+                print(f"=== {f} ===")
+                print(fp.read()[:3000])
+except Exception as e:
+    print(f"INSPECT ERROR: {e}")
+# END TEMPORARY
 """
 BetPoly - Telegram Sports Betting Bot
 Polymarket odds in Sportybet format for African bettors.
