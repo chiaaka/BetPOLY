@@ -1,0 +1,1172 @@
+"""
+BetPoly - Trade Execution Engine
+Places real bets on Polymarket via CLOB API.
+
+Flow:
+  1. User taps odds → bet slip → confirms
+  2. trade.place_bet() called with token_id, price, amount
+  3. Deducts platform fee (1%)
+  4. Creates and posts order to Polymarket CLOB
+  5. Returns order confirmation or error
+
+Uses py-clob-client for Polymarket's Central Limit Order Book.
+Each user has a deterministic wallet (from wallet.py).
+"""
+
+import json
+import logging
+import time
+from decimal import Decimal, ROUND_DOWN
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+from web3 import Web3
+from config import POLYGON_RPC_URL, ADMIN_WALLET, PLATFORM_FEE_RATE as CONFIG_FEE_RATE
+
+logger = logging.getLogger("BetPoly.Trade")
+
+# Polymarket CLOB endpoints
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137  # Polygon mainnet
+
+# USDC on Polygon — check BOTH contracts
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (bridged, used by Polymarket)
+USDC_NATIVE_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Native USDC (Circle)
+USDC_DECIMALS = 6
+
+# Polymarket contract addresses for approvals
+CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"       # CTF Exchange
+NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # Neg Risk CTF Exchange
+NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"      # Neg Risk Adapter
+CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"          # Conditional Tokens (CTF)
+
+# Platform fee
+PLATFORM_FEE_RATE = CONFIG_FEE_RATE if CONFIG_FEE_RATE else 0.01  # 1%
+
+# Max uint256 for unlimited approval
+MAX_ALLOWANCE = 2**256 - 1
+
+
+def _get_w3():
+    """Create a Web3 instance with POA middleware for Polygon."""
+    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL))
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware  # web3.py v7+
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except ImportError:
+        try:
+            from web3.middleware import geth_poa_middleware  # web3.py v5
+            w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        except ImportError:
+            logger.warning("Could not load POA middleware — tx building may fail")
+    return w3
+
+
+def set_allowances(private_key: str) -> bool:
+    """
+    Set token allowances for Polymarket trading. One-time per wallet.
+    Approves USDC.e spending and CTF token management for both exchanges.
+    Requires POL/MATIC for gas (~0.01 POL total for 5 transactions).
+    
+    Uses the exact same approach as the official Polymarket gist:
+    https://gist.github.com/poly-rodr/44313920481de58d5a3f6d1f8226bd5e
+    """
+    if not POLYGON_RPC_URL:
+        logger.error("No POLYGON_RPC_URL configured for allowance setup")
+        return False
+    
+    try:
+        w3 = _get_w3()
+        account = w3.eth.account.from_key(private_key)
+        wallet = account.address
+        logger.info(f"Setting Polymarket allowances for {wallet}...")
+        
+        # Use exact ABI from official gist
+        erc20_abi = json.loads('[{"constant": false,"inputs": [{"name": "_spender","type": "address" },{ "name": "_value", "type": "uint256" }],"name": "approve","outputs": [{ "name": "", "type": "bool" }],"payable": false,"stateMutability": "nonpayable","type": "function"}]')
+        erc1155_abi = json.loads('[{"inputs": [{ "internalType": "address", "name": "operator", "type": "address" },{ "internalType": "bool", "name": "approved", "type": "bool" }],"name": "setApprovalForAll","outputs": [],"stateMutability": "nonpayable","type": "function"}]')
+        
+        usdc_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=erc20_abi)
+        ctf_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CTF_CONTRACT), abi=erc1155_abi)
+        
+        nonce = w3.eth.get_transaction_count(wallet)
+        
+        # Use MAX_INT from web3 constants — same as official gist
+        from web3.constants import MAX_INT
+        max_approval = int(MAX_INT, 16)  # Convert hex string to int
+        
+        txs_sent = 0
+        
+        # 1. Approve USDC.e for CTF Exchange + Neg Risk CTF Exchange + Neg Risk Adapter
+        for spender_name, spender_addr in [
+            ("CTF Exchange", CTF_EXCHANGE),
+            ("Neg Risk CTF Exchange", NEG_RISK_CTF_EXCHANGE),
+            ("Neg Risk Adapter", NEG_RISK_ADAPTER),
+        ]:
+            tx = usdc_contract.functions.approve(
+                Web3.to_checksum_address(spender_addr), max_approval
+            ).build_transaction({
+                "from": wallet, "nonce": nonce,
+                "gas": 100000,  # Increased from 60000
+                "chainId": CHAIN_ID
+            })
+            signed = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt['status'] == 1:
+                logger.info(f"  ✅ USDC.e approved for {spender_name}: {tx_hash.hex()}")
+            else:
+                logger.error(f"  ❌ USDC.e approve REVERTED for {spender_name}: {tx_hash.hex()}")
+                return False
+            nonce += 1
+            txs_sent += 1
+        
+        # 2. Approve CTF tokens for exchanges + adapter
+        for operator_name, operator_addr in [
+            ("CTF Exchange", CTF_EXCHANGE),
+            ("Neg Risk CTF Exchange", NEG_RISK_CTF_EXCHANGE),
+            ("Neg Risk Adapter", NEG_RISK_ADAPTER),
+        ]:
+            tx = ctf_contract.functions.setApprovalForAll(
+                Web3.to_checksum_address(operator_addr), True
+            ).build_transaction({
+                "from": wallet, "nonce": nonce,
+                "gas": 100000,  # Increased from 60000
+                "chainId": CHAIN_ID
+            })
+            signed = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt['status'] == 1:
+                logger.info(f"  ✅ CTF approved for {operator_name}: {tx_hash.hex()}")
+            else:
+                logger.error(f"  ❌ CTF approve REVERTED for {operator_name}: {tx_hash.hex()}")
+                return False
+            nonce += 1
+            txs_sent += 1
+        
+        logger.info(f"  🎉 All {txs_sent} allowances set successfully!")
+        return True
+        
+    except Exception as e:
+        logger.error(f"  ❌ Allowance setup failed: {e}")
+        return False
+
+
+def check_allowances(private_key: str = "", address: str = "") -> bool:
+    """Quick check if USDC.e allowance is set for CTF Exchange."""
+    try:
+        if not POLYGON_RPC_URL:
+            return False
+        w3 = _get_w3()
+        
+        if address:
+            wallet = Web3.to_checksum_address(address)
+        elif private_key:
+            wallet = w3.eth.account.from_key(private_key).address
+        else:
+            return False
+        
+        abi = [{"constant": True, "inputs": [
+            {"name": "_owner", "type": "address"},
+            {"name": "_spender", "type": "address"}
+        ], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}],
+            "type": "function"}]
+        
+        c = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=abi)
+        allowance = c.functions.allowance(wallet, Web3.to_checksum_address(CTF_EXCHANGE)).call()
+        logger.info(f"  Allowance check: USDC.e→CTF Exchange = {allowance}")
+        return allowance > 0
+    except Exception as e:
+        logger.warning(f"  Allowance check failed: {e}")
+        return False
+
+
+def get_usdc_balance(private_key: str = "", address: str = "") -> float:
+    """Get total USDC balance (USDC.e + native USDC) for a wallet on Polygon."""
+    bals = get_usdc_balances(private_key=private_key, address=address)
+    return round(bals["usdc_e"] + bals["usdc_native"], 2)
+
+
+def get_usdc_balances(private_key: str = "", address: str = "") -> dict:
+    """Get separate USDC.e and native USDC balances."""
+    result = {"usdc_e": 0.0, "usdc_native": 0.0}
+    try:
+        if not POLYGON_RPC_URL:
+            return result
+        
+        w3 = _get_w3()
+        
+        if address:
+            wallet_addr = Web3.to_checksum_address(address)
+        elif private_key:
+            account = w3.eth.account.from_key(private_key)
+            wallet_addr = account.address
+        else:
+            return result
+        
+        usdc_abi = [{"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+                     "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
+                     "type": "function"}]
+        
+        # USDC.e (Polymarket uses this)
+        try:
+            c = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=usdc_abi)
+            result["usdc_e"] = round(c.functions.balanceOf(wallet_addr).call() / (10 ** USDC_DECIMALS), 2)
+        except Exception:
+            pass
+        
+        # Native USDC
+        try:
+            c = w3.eth.contract(address=Web3.to_checksum_address(USDC_NATIVE_ADDRESS), abi=usdc_abi)
+            result["usdc_native"] = round(c.functions.balanceOf(wallet_addr).call() / (10 ** USDC_DECIMALS), 2)
+        except Exception:
+            pass
+        
+    except Exception as e:
+        logger.error(f"Balance check failed: {e}")
+    
+    return result
+
+
+def get_matic_balance(private_key: str = "", address: str = "") -> float:
+    """Get MATIC/POL balance for gas. Can use address OR private key."""
+    try:
+        if not POLYGON_RPC_URL:
+            return 0.0
+        w3 = _get_w3()
+        
+        if address:
+            wallet_addr = Web3.to_checksum_address(address)
+        elif private_key:
+            account = w3.eth.account.from_key(private_key)
+            wallet_addr = account.address
+        else:
+            return 0.0
+        
+        bal = w3.eth.get_balance(wallet_addr)
+        return round(w3.from_wei(bal, 'ether'), 4)
+    except Exception as e:
+        logger.error(f"MATIC balance check failed: {e}")
+        return 0.0
+
+
+def _get_clob_client(private_key: str, safe_address: str = "") -> ClobClient:
+    """
+    Create a CLOB client for a user's wallet.
+    Uses signature_type=2 (Gnosis Safe) — the official Polymarket way.
+    Safe address is deterministic from private key, but can be passed for speed.
+    Includes BuilderConfig for order attribution.
+    """
+    if not safe_address:
+        # Derive Safe address from private key if not provided
+        try:
+            import wallet as _wallet
+            safe_address = _wallet.get_safe_address(private_key)
+        except Exception:
+            pass
+    
+    # Try to attach builder config for order attribution
+    builder_config = None
+    try:
+        from config import BUILDER_API_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE
+        if BUILDER_API_KEY and BUILDER_SECRET and BUILDER_PASSPHRASE:
+            from py_builder_signing_sdk.config import BuilderConfig
+            from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+            creds = BuilderApiKeyCreds(
+                key=BUILDER_API_KEY,
+                secret=BUILDER_SECRET,
+                passphrase=BUILDER_PASSPHRASE,
+            )
+            builder_config = BuilderConfig(local_builder_creds=creds)
+            logger.info("  Builder config attached for order attribution")
+    except Exception as e:
+        logger.debug(f"  Builder config not available: {e}")
+    
+    client_kwargs = dict(
+        host=CLOB_HOST,
+        key=private_key,
+        chain_id=CHAIN_ID,
+        signature_type=2,
+        funder=safe_address,
+    )
+    
+    if builder_config:
+        client_kwargs["builder_config"] = builder_config
+        logger.info("  ✅ Builder API key connected — orders will be attributed")
+    else:
+        logger.warning("  ⚠️ No builder config — orders NOT attributed to BetPoly")
+    
+    try:
+        client = ClobClient(**client_kwargs)
+    except TypeError as e:
+        # py-clob-client version may not support builder_config param
+        if "builder_config" in str(e):
+            logger.warning("  ⚠️ ClobClient doesn't accept builder_config — upgrading py-clob-client may fix this")
+            client_kwargs.pop("builder_config", None)
+            client = ClobClient(**client_kwargs)
+        else:
+            raise
+    # Derive L2 API credentials (deterministic — same key always produces same creds)
+    api_creds = client.create_or_derive_api_creds()
+    client.set_api_creds(api_creds)
+    logger.info(f"  CLOB client ready (Safe), API key: {api_creds.api_key[:8]}...")
+    return client
+
+
+def calculate_fee(amount_usdc: float) -> dict:
+    """Calculate platform fee and net bet amount."""
+    fee = round(amount_usdc * PLATFORM_FEE_RATE, 6)
+    net_amount = round(amount_usdc - fee, 6)
+    return {
+        "gross": amount_usdc,
+        "fee": fee,
+        "fee_rate": PLATFORM_FEE_RATE,
+        "net": net_amount,
+    }
+
+
+async def place_bet(
+    private_key: str,
+    token_id: str,
+    price: float,
+    amount_usdc: float,
+    match_name: str = "",
+    selection: str = "",
+    safe_address: str = "",
+) -> dict:
+    """
+    Place a bet on Polymarket.
+    
+    Args:
+        private_key: User's EOA private key (controls the Safe)
+        token_id: Polymarket CLOB token ID for the outcome
+        price: Current price (probability, 0.01-0.99)
+        amount_usdc: Gross amount in USDC (before fee)
+        match_name: Human-readable match name for logging
+        selection: Human-readable selection name
+        safe_address: User's Gnosis Safe address (where USDC lives)
+    
+    Returns:
+        dict with: success, order_id, shares, fee, net_amount, error
+    """
+    result = {
+        "success": False,
+        "order_id": "",
+        "shares": 0,
+        "fee": 0,
+        "net_amount": 0,
+        "gross_amount": amount_usdc,
+        "price": price,
+        "error": "",
+    }
+    
+    try:
+        # Validate inputs
+        if not token_id:
+            result["error"] = "No market token ID available for this selection."
+            return result
+        
+        if not private_key:
+            result["error"] = "Wallet not configured. Please set up your wallet first."
+            return result
+        
+        if price <= 0.005 or price >= 0.995:
+            result["error"] = "Odds too extreme. Market may be settled."
+            return result
+        
+        if amount_usdc < 1.0:
+            result["error"] = "Minimum bet is $1 USDC."
+            return result
+        
+        # Check balance (from Safe address if available, otherwise EOA)
+        bal_addr = safe_address if safe_address else ""
+        balance = get_usdc_balance(private_key=private_key, address=bal_addr)
+        
+        # Calculate fee — fee is on top, full amount goes to Polymarket
+        fee_info = calculate_fee(amount_usdc)
+        fee = fee_info["fee"]
+        net_amount = amount_usdc  # Full amount goes to Polymarket
+        total_needed = amount_usdc + fee  # User pays amount + fee
+        
+        # Check balance covers amount + fee
+        if balance < total_needed:
+            result["error"] = f"Insufficient balance. Need ${total_needed:.2f} (${amount_usdc:.2f} bet + ${fee:.2f} fee), you have ${balance:.2f}."
+            return result
+        
+        # Polymarket minimum is $1
+        if net_amount < 1.0:
+            result["error"] = "Minimum bet is $1 USDC."
+            return result
+        
+        # Calculate shares: amount / price
+        # Polymarket requires size rounded to 2 decimals
+        # CLOB computes fill cost as floor(size * price * 10^6) / 10^6 (USDC has 6 decimals)
+        # We must ensure this floor result >= $1.00 (1000000 micro-USDC)
+        import math
+        
+        # Price may also need rounding to tick_size for accurate cost calculation
+        # Use the price as-is for the order (CLOB will handle tick alignment)
+        # But for cost calculation, round DOWN to tick_size to model worst case
+        calc_price = math.floor(price * 100) / 100  # Round down to 0.01 (common tick)
+        if calc_price <= 0:
+            calc_price = price  # safety fallback
+        
+        # Start with exact shares needed (using worst-case price)
+        shares = math.ceil((net_amount / calc_price) * 100) / 100
+        
+        # Keep adding 0.01 shares until CLOB's floor calculation >= $1
+        for _ in range(10):
+            clob_cost_micro = math.floor(shares * calc_price * 1_000_000)
+            if clob_cost_micro >= 1_000_000:
+                break
+            shares = round(shares + 0.01, 2)
+        
+        # Cost = shares * price (confirmed by Polymarket docs — same for both
+        # standard and neg_risk markets)
+        order_cost = clob_cost_micro / 1_000_000
+        total_needed = order_cost + fee
+        
+        # Re-check balance with actual cost
+        if balance < total_needed:
+            result["error"] = f"Insufficient balance. Need ${total_needed:.2f}, you have ${balance:.2f}."
+            return result
+        
+        logger.info(f"Placing bet: {match_name} | {selection} | "
+                    f"gross=${amount_usdc} fee=${fee} net=${net_amount} "
+                    f"price={price} calc_price={calc_price} shares={shares} "
+                    f"cost=${order_cost} clob_micro={clob_cost_micro} token={token_id[:12]}...")
+        
+        # Create CLOB client (signature_type=2 with Safe)
+        client = _get_clob_client(private_key, safe_address=safe_address)
+        
+        # CRITICAL: Cancel any stale open orders that may be reserving balance
+        # The CLOB reserves balance for ALL unfilled orders:
+        # maxOrderSize = balance - Σ(unfilled order amounts)
+        try:
+            open_orders = client.get_orders()
+            if open_orders:
+                logger.info(f"  ⚠️ Found {len(open_orders)} open orders reserving balance — cancelling all")
+                client.cancel_all()
+                logger.info(f"  ✅ Cancelled all open orders")
+            else:
+                logger.info(f"  No open orders (balance fully available)")
+        except Exception as co_err:
+            logger.warning(f"  Could not check/cancel open orders: {co_err}")
+        
+        # Refresh CLOB's cached view of our on-chain balance/allowance
+        needs_approve = False
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            # Refresh COLLATERAL (USDC.e) 
+            client.update_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL
+            ))
+            bal = client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL
+            ))
+            logger.info(f"  CLOB COLLATERAL: {bal}")
+            
+            # Also refresh CONDITIONAL (CTF tokens) for this specific token
+            client.update_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            ))
+            cond_bal = client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            ))
+            logger.info(f"  CLOB CONDITIONAL: {cond_bal}")
+            
+            # Check if ANY USDC.e allowance is 0 (need all 3 contracts approved)
+            allowances = bal.get("allowances", {})
+            usdc_any_zero = any(int(v) == 0 for v in allowances.values()) if allowances else True
+            
+            # Check if ANY CTF allowance is 0
+            cond_allowances = cond_bal.get("allowances", {})
+            ctf_any_zero = any(int(v) == 0 for v in cond_allowances.values()) if cond_allowances else True
+            
+            if usdc_any_zero or ctf_any_zero:
+                needs_approve = True
+                logger.info(f"  ⚠️ Missing allowances (USDC_any_zero={usdc_any_zero}, CTF_any_zero={ctf_any_zero}), running approve...")
+        except Exception as ube:
+            logger.warning(f"  Could not check CLOB balance: {ube}")
+        
+        if needs_approve:
+            # Set approvals via wallet.py (gasless via Builder Relayer)
+            try:
+                import wallet as _wallet
+                appr = _wallet.set_approvals(private_key)
+                if not appr.get("success"):
+                    result["error"] = f"Failed to set approvals: {appr.get('error', 'unknown')}"
+                    return result
+            except Exception as ae:
+                logger.error(f"  Approval fallback failed: {ae}")
+                result["error"] = "Wallet not properly onboarded. Re-run setup."
+                return result
+            # Refresh caches after approval
+            try:
+                client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id))
+            except:
+                pass
+        
+        # Query market info for neg_risk and tick_size
+        neg_risk = False
+        tick_size = "0.01"
+        try:
+            neg_risk = client.get_neg_risk(token_id)
+            tick_size = client.get_tick_size(token_id)
+            logger.info(f"  Market info: neg_risk={neg_risk}, tick_size={tick_size}")
+        except Exception as mie:
+            logger.warning(f"  Could not get market info: {mie}")
+        
+        # Debug: Log USDC.e vs native USDC separately
+        bals = get_usdc_balances(private_key=private_key, address=bal_addr)
+        logger.info(f"  On-chain: USDC.e=${bals['usdc_e']}, Native USDC=${bals['usdc_native']}, POL={get_matic_balance(private_key=private_key)}")
+        
+        # Use MARKET ORDER (FOK) — $1 minimum, no 5-share minimum like limit orders
+        from py_clob_client.clob_types import MarketOrderArgs
+        
+        # Version-safe: newer py-clob-client requires side=BUY, older does not
+        try:
+            market_order = MarketOrderArgs(
+                token_id=token_id,
+                amount=round(net_amount, 2),
+                side=BUY,
+                order_type=OrderType.FOK,
+            )
+        except TypeError:
+            # Older version without side parameter
+            try:
+                market_order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(net_amount, 2),
+                    order_type=OrderType.FOK,
+                )
+            except TypeError:
+                # Even older — just token_id and amount
+                market_order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(net_amount, 2),
+                )
+        
+        from py_clob_client.clob_types import PartialCreateOrderOptions
+        options = PartialCreateOrderOptions(
+            neg_risk=neg_risk,
+            tick_size=tick_size,
+        )
+        
+        logger.info(f"  Posting MARKET order (FOK): amount=${net_amount:.2f} neg_risk={neg_risk} tick_size={tick_size}")
+        signed = client.create_market_order(market_order, options=options)
+        response = client.post_order(signed, OrderType.FOK)
+        
+        if response and response.get("orderID"):
+            result["success"] = True
+            result["order_id"] = response["orderID"]
+            result["shares"] = shares
+            result["fee"] = fee
+            result["net_amount"] = net_amount
+            logger.info(f"  ✅ Order placed: {response['orderID']}")
+            
+            # Collect platform fee — transfer to admin wallet (async, non-blocking)
+            if fee > 0 and ADMIN_WALLET:
+                try:
+                    fee_result = await collect_fee(
+                        private_key=private_key,
+                        safe_address=safe_address,
+                        fee_usdc=fee,
+                    )
+                    if fee_result.get("success"):
+                        logger.info(f"  💸 Fee ${fee:.4f} collected")
+                    else:
+                        logger.warning(f"  ⚠️ Fee collection failed: {fee_result.get('error')}")
+                except Exception as fe:
+                    logger.warning(f"  ⚠️ Fee collection error: {fe}")
+        else:
+            error_msg = response.get("errorMsg", str(response)) if response else "No response from CLOB"
+            result["error"] = f"Order rejected: {error_msg}"
+            logger.error(f"  ❌ Order failed: {error_msg}")
+        
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"  ❌ Trade execution error: {error_str[:200]}")
+        
+        # User-friendly error messages
+        if "cloudflare" in error_str.lower() or "403" in error_str or "unable to access" in error_str.lower() or "<!DOCTYPE" in error_str:
+            result["error"] = "Server blocked by Cloudflare. Polymarket Builders Program whitelist needed. Contact support."
+        elif "lower than the minimum" in error_str:
+            # Parse: "Size (1.97) lower than the minimum: 5"
+            import re
+            m = re.search(r'minimum:\s*(\d+)', error_str)
+            min_shares = int(m.group(1)) if m else 5
+            min_cost = round(min_shares * price, 2)
+            result["error"] = f"Minimum bet for this market is {min_shares} shares (${min_cost:.2f}). Please increase your stake."
+        elif "invalid amount" in error_str and "min size" in error_str:
+            # Parse: "invalid amount for a marketable BUY order ($0.996), min size: $1"
+            result["error"] = "Bet amount too low after rounding. Please try a slightly higher amount."
+        elif "insufficient" in error_str.lower() or ("balance" in error_str.lower() and "allowance" not in error_str.lower()):
+            result["error"] = "Insufficient USDC balance. Please deposit more funds."
+        elif "allowance" in error_str.lower() or "approve" in error_str.lower():
+            result["error"] = "Token approval needed. Please try again (auto-approving)."
+        elif "nonce" in error_str.lower():
+            result["error"] = "Transaction conflict. Please try again in a few seconds."
+        else:
+            # Strip any HTML from error messages
+            clean_err = error_str[:150]
+            if "<" in clean_err:
+                clean_err = "Trade execution failed. Please try again."
+            result["error"] = f"Trade failed: {clean_err}"
+    
+    return result
+
+
+async def get_positions(private_key: str, safe_address: str = "") -> list:
+    """
+    Fetch user's positions from Polymarket Data API.
+    This is ON-CHAIN data — survives bot redeployment.
+    
+    Endpoint: GET https://data-api.polymarket.com/positions?user={address}
+    Returns: size, avgPrice, currentValue, cashPnl, percentPnl, redeemable, title, outcome, etc.
+    """
+    try:
+        if not safe_address:
+            from eth_account import Account
+            acct = Account.from_key(private_key)
+            safe_address = acct.address
+        
+        import requests
+        resp = requests.get(
+            f"https://data-api.polymarket.com/positions",
+            params={
+                "user": safe_address,
+                "sizeThreshold": 0,
+                "limit": 100,
+            },
+            timeout=10,
+        )
+        
+        if not resp.ok:
+            logger.warning(f"Data API positions returned {resp.status_code}")
+            return []
+        
+        data = resp.json()
+        if not isinstance(data, list):
+            return []
+        
+        # Set up on-chain balance check for BOTH CTF and NegRiskAdapter
+        # Regular markets: tokens on CTF (0x4D97...)
+        # Neg risk markets: tokens on NegRiskAdapter (0xd91E...) OR CTF
+        balance_contracts = []
+        try:
+            from web3 import Web3
+            BALANCE_ABI = [{"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+            w3 = Web3(Web3.HTTPProvider(os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")))
+            safe_cs = Web3.to_checksum_address(safe_address)
+            
+            # CTF contract
+            ctf = w3.eth.contract(
+                address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                abi=BALANCE_ABI
+            )
+            balance_contracts.append(("CTF", ctf))
+            
+            # NegRiskAdapter 
+            neg = w3.eth.contract(
+                address=Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"),
+                abi=BALANCE_ABI
+            )
+            balance_contracts.append(("NegRisk", neg))
+        except Exception as e:
+            logger.debug(f"  Contract setup failed: {e}")
+            safe_cs = None
+        
+        positions = []
+        for p in data:
+            size = float(p.get("size", 0))
+            cur_price = float(p.get("curPrice", 0))
+            current_value = float(p.get("currentValue", 0))
+            redeemable = bool(p.get("redeemable", False))
+            token_id = p.get("asset", "")
+            condition_id = p.get("conditionId", "")
+            
+            # Derive status from API data
+            if redeemable:
+                # Check balance on ALL contracts — if zero on all, it's redeemed
+                if balance_contracts and token_id and safe_cs:
+                    total_bal = 0
+                    for name, contract in balance_contracts:
+                        try:
+                            bal = contract.functions.balanceOf(safe_cs, int(token_id)).call()
+                            total_bal += bal
+                            if bal > 0:
+                                logger.info(f"  {name} balance for {token_id[:15]}...: {bal}")
+                        except Exception as e:
+                            logger.debug(f"  {name} balanceOf failed for {token_id[:15]}...: {e}")
+                    
+                    if total_bal == 0:
+                        logger.info(f"  Skipping redeemed position (all balances=0): {token_id[:15]}...")
+                        continue
+                
+                status = "won"
+            elif size < 0.01:
+                continue  # No shares — skip entirely
+            elif cur_price <= 0.01 and current_value < 0.01:
+                status = "lost"
+            else:
+                status = "active"
+            
+            positions.append({
+                "token_id": p.get("asset", ""),
+                "condition_id": p.get("conditionId", ""),
+                "title": p.get("title", ""),
+                "outcome": p.get("outcome", ""),
+                "size": size,
+                "avg_price": float(p.get("avgPrice", 0)),
+                "initial_value": float(p.get("initialValue", 0)),
+                "current_value": current_value,
+                "cur_price": cur_price,
+                "cash_pnl": float(p.get("cashPnl", 0)),
+                "percent_pnl": float(p.get("percentPnl", 0)),
+                "realized_pnl": float(p.get("realizedPnl", 0)),
+                "redeemable": redeemable,
+                "mergeable": bool(p.get("mergeable", False)),
+                "neg_risk": bool(p.get("negativeRisk", False)),
+                "status": status,
+                "slug": p.get("slug", ""),
+                "event_slug": p.get("eventSlug", ""),
+                "icon": p.get("icon", ""),
+                "end_date": p.get("endDate", ""),
+                "opposite_outcome": p.get("oppositeOutcome", ""),
+                "opposite_asset": p.get("oppositeAsset", ""),
+            })
+        
+        logger.info(f"Fetched {len(positions)} on-chain positions for {safe_address[:10]}...")
+        return positions
+    except Exception as e:
+        logger.error(f"Failed to fetch positions: {e}")
+        return []
+
+
+async def get_trades_history(wallet_address: str) -> list:
+    """
+    Fetch trade history from Polymarket's API.
+    Uses the public API endpoint, no private key needed.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://data-api.polymarket.com/trades",
+                params={"maker": wallet_address, "limit": 50}
+            )
+            if resp.status_code == 200:
+                return resp.json() or []
+    except Exception as e:
+        logger.error(f"Failed to fetch trade history: {e}")
+    return []
+
+
+async def get_user_stats_from_api(safe_address: str) -> dict:
+    """
+    Derive all user stats from Polymarket Data API.
+    No local DB needed — survives every redeploy.
+    
+    Endpoints used:
+      GET /activity?type=TRADE  → volume (usdcSize field)
+      GET /closed-positions     → wins/losses/profit (realizedPnl field)
+    
+    Returns: {volume, wins, losses, profit, open_positions}
+    """
+    import requests
+    stats = {"volume": 0, "wins": 0, "losses": 0, "profit": 0, "open_positions": 0}
+    
+    try:
+        # 1. Volume from trade activity (usdcSize = actual USDC spent)
+        offset = 0
+        while True:
+            resp = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": safe_address, "type": "TRADE", "side": "BUY", "limit": 500, "offset": offset},
+                timeout=15,
+            )
+            if not resp.ok:
+                break
+            trades = resp.json() or []
+            if not trades:
+                break
+            for t in trades:
+                usdc_size = t.get("usdcSize")
+                if usdc_size is not None and float(usdc_size) > 0:
+                    stats["volume"] += float(usdc_size)
+                else:
+                    stats["volume"] += float(t.get("size", 0)) * float(t.get("price", 0))
+            if len(trades) < 500:
+                break
+            offset += 500
+        
+        # 2. Wins/losses/profit from closed positions (realizedPnl)
+        offset = 0
+        while True:
+            resp = requests.get(
+                "https://data-api.polymarket.com/closed-positions",
+                params={"user": safe_address, "limit": 50, "offset": offset},
+                timeout=15,
+            )
+            if not resp.ok:
+                break
+            closed = resp.json() or []
+            if not closed:
+                break
+            for p in closed:
+                realized_pnl = float(p.get("realizedPnl", 0))
+                if realized_pnl > 0:
+                    stats["wins"] += 1
+                elif realized_pnl < 0:
+                    stats["losses"] += 1
+                stats["profit"] += realized_pnl
+            if len(closed) < 50:
+                break
+            offset += 50
+        
+        # 3. Count open positions
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": safe_address, "sizeThreshold": 0.01, "limit": 100},
+            timeout=15,
+        )
+        if resp.ok:
+            open_pos = resp.json() or []
+            stats["open_positions"] = len([p for p in open_pos if float(p.get("size", 0)) > 0.01])
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch user stats from API: {e}")
+    
+    stats["volume"] = round(stats["volume"], 2)
+    stats["profit"] = round(stats["profit"], 2)
+    return stats
+
+
+async def get_redeemed_tokens(safe_address: str) -> set:
+    """
+    Get set of token IDs that have already been redeemed.
+    Uses activity API — no local DB needed.
+    """
+    import requests
+    redeemed = set()
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/activity",
+            params={"user": safe_address, "type": "REDEEM", "limit": 500},
+            timeout=15,
+        )
+        if resp.ok:
+            activities = resp.json() or []
+            for a in activities:
+                asset = a.get("asset", "")
+                if asset:
+                    redeemed.add(asset)
+    except Exception as e:
+        logger.error(f"Failed to fetch redeem activity: {e}")
+    return redeemed
+
+
+async def sell_position(
+    private_key: str,
+    token_id: str,
+    shares: float,
+    safe_address: str = "",
+) -> dict:
+    """
+    Sell a position using FOK market order — same pattern as buy.
+    For SELL: amount = number of shares.
+    Uses version-safe MarketOrderArgs with try/except fallback.
+    """
+    result = {"success": False, "error": None, "order_id": None, "amount": 0}
+    try:
+        client = _get_clob_client(private_key, safe_address=safe_address)
+        
+        neg_risk = False
+        tick_size = "0.01"
+        try:
+            neg_risk = client.get_neg_risk(token_id)
+            tick_size = client.get_tick_size(token_id)
+        except:
+            pass
+        
+        sell_shares = round(shares, 2)
+        
+        # Update and check conditional token allowance
+        needs_approve = False
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            client.update_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            ))
+            # Check actual conditional balance
+            cond_bal = client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            ))
+            if isinstance(cond_bal, dict):
+                raw_balance = int(cond_bal.get("balance", 0))
+                # Conditional tokens have 6 decimal places (same as USDC.e)
+                actual_shares = raw_balance / 1_000_000
+                logger.info(f"  Conditional balance: raw={raw_balance} = {actual_shares:.6f} shares, want to sell {sell_shares}")
+                
+                # Check if any allowance is zero or too low
+                allowances = cond_bal.get("allowances", {})
+                for spender, val in allowances.items():
+                    if int(val) < raw_balance:
+                        needs_approve = True
+                        logger.info(f"  ⚠️ Conditional allowance too low for {spender[:10]}...")
+                        break
+                
+                # ALWAYS use actual balance, rounded DOWN to 2 decimals
+                import math
+                actual_sellable = math.floor(actual_shares * 100) / 100  # round DOWN
+                if actual_sellable <= 0:
+                    result["error"] = "No shares to sell — position may not be settled yet. Try again in a moment."
+                    return result
+                if actual_sellable < sell_shares:
+                    logger.warning(f"  Adjusting sell amount from {sell_shares} to {actual_sellable}")
+                    sell_shares = actual_sellable
+        except Exception as be:
+            logger.warning(f"  Could not check conditional balance: {be}")
+        
+        # If allowances are missing, set them (same as buy flow)
+        if needs_approve:
+            try:
+                import wallet as _wallet
+                logger.info("  Setting CTF approvals for sell...")
+                appr = _wallet.set_approvals(private_key)
+                logger.info(f"  Approvals result: {appr}")
+                # Refresh cache after approval
+                client.update_balance_allowance(BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                ))
+            except Exception as ae:
+                logger.error(f"  Approval for sell failed: {ae}")
+        
+        from py_clob_client.clob_types import MarketOrderArgs, PartialCreateOrderOptions
+        
+        # sell_shares already set and possibly adjusted by balance check above
+        
+        # Version-safe MarketOrderArgs — same pattern that fixed buying
+        # Try newest signature first (0.34.5+: has side param)
+        try:
+            market_order = MarketOrderArgs(
+                token_id=token_id,
+                amount=sell_shares,
+                side=SELL,
+                order_type=OrderType.FOK,
+            )
+        except TypeError:
+            # Fallback for 0.18.0 without side
+            try:
+                market_order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=sell_shares,
+                    order_type=OrderType.FOK,
+                )
+            except TypeError:
+                # Even older — just token_id and amount
+                market_order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=sell_shares,
+                )
+        
+        options = PartialCreateOrderOptions(neg_risk=neg_risk, tick_size=tick_size)
+        
+        logger.info(f"Selling (FOK): token={token_id[:16]}... shares={sell_shares} neg_risk={neg_risk}")
+        signed = client.create_market_order(market_order, options=options)
+        response = client.post_order(signed, OrderType.FOK)
+        
+        if response and response.get("orderID"):
+            result["success"] = True
+            result["order_id"] = response["orderID"]
+            result["amount"] = sell_shares
+            logger.info(f"  ✅ Sell order placed: {response['orderID']}")
+        else:
+            error_msg = response.get("errorMsg", str(response)) if response else "No response"
+            result["error"] = error_msg
+            logger.error(f"  ❌ Sell failed: {error_msg}")
+    except Exception as e:
+        result["error"] = str(e)[:200]
+        logger.error(f"  ❌ Sell error: {result['error']}")
+    return result
+
+
+def get_current_price(token_id: str) -> float:
+    """Get current market price for a token (read-only, no auth needed)."""
+    try:
+        client = ClobClient("https://clob.polymarket.com", chain_id=137)
+        price_data = client.get_price(token_id, side="SELL")
+        if price_data and isinstance(price_data, dict):
+            return float(price_data.get("price", 0.5))
+        elif price_data:
+            return float(price_data)
+    except Exception as e:
+        logger.warning(f"Could not get price for {token_id[:16]}...: {e}")
+    return 0.5  # fallback
+
+
+async def collect_fee(private_key: str, safe_address: str, fee_usdc: float) -> dict:
+    """
+    Transfer platform fee from user's Safe to admin wallet.
+    Uses wallet.py relay client (same one that works for onboarding).
+    """
+    result = {"success": False, "tx_hash": None, "error": None}
+    
+    if not ADMIN_WALLET:
+        logger.warning("ADMIN_WALLET not set — fee not collected")
+        result["error"] = "Admin wallet not configured"
+        return result
+    
+    if fee_usdc < 0.001:
+        result["error"] = "Fee too small to collect"
+        return result
+    
+    try:
+        import wallet
+        
+        # USDC.e has 6 decimals
+        fee_micro = int(fee_usdc * 1_000_000)
+        
+        # ERC20 transfer(address to, uint256 amount) function selector = 0xa9059cbb
+        admin_addr = Web3.to_checksum_address(ADMIN_WALLET)
+        
+        transfer_data = (
+            "0xa9059cbb"
+            + admin_addr[2:].lower().zfill(64)
+            + hex(fee_micro)[2:].zfill(64)
+        )
+        
+        USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        
+        # Use wallet.py's relay client (same as onboarding — known working)
+        relay_client = wallet.create_relay_client(private_key)
+        
+        # Build SafeTransaction (same format as approvals)
+        from py_builder_relayer_client.models import SafeTransaction
+        try:
+            from py_builder_relayer_client.models import OperationType
+            op_call = OperationType.Call
+        except ImportError:
+            try:
+                from py_builder_relayer_client import OperationType
+                op_call = OperationType.Call
+            except ImportError:
+                class _OpCall:
+                    value = 0
+                op_call = _OpCall()
+        
+        tx = SafeTransaction(
+            to=USDC_E,
+            data=transfer_data,
+            value="0",
+            operation=op_call,
+        )
+        
+        response = relay_client.execute([tx], "Platform fee collection")
+        
+        tx_hash = None
+        if hasattr(response, "wait"):
+            res = response.wait()
+            if res:
+                tx_hash = getattr(res, "transactionHash", None) or getattr(res, "transaction_hash", None)
+        elif isinstance(response, dict):
+            tx_hash = response.get("transactionHash") or response.get("transaction_hash")
+        
+        result["success"] = True
+        result["tx_hash"] = str(tx_hash) if tx_hash else "submitted"
+        logger.info(f"  💸 Fee collected: ${fee_usdc:.4f} → {ADMIN_WALLET[:10]}... tx={result['tx_hash']}")
+        
+    except Exception as e:
+        result["error"] = str(e)[:200]
+        logger.error(f"  ❌ Fee collection error: {result['error']}")
+    
+    return result
+
+
+async def withdraw_usdc(private_key: str, safe_address: str, to_address: str, amount_usdc: float) -> dict:
+    """
+    Withdraw USDC.e from user's Safe to any external wallet.
+    Gasless via Builder Relayer.
+    """
+    result = {"success": False, "tx_hash": None, "error": None}
+    
+    if amount_usdc < 0.01:
+        result["error"] = "Minimum withdrawal is $0.01"
+        return result
+    
+    try:
+        import wallet
+        
+        # Validate destination address
+        to_addr = Web3.to_checksum_address(to_address)
+        
+        # Check USDC balance first
+        balance = get_usdc_balance(private_key, safe_address)
+        if balance < amount_usdc:
+            result["error"] = f"Insufficient balance. Available: ${balance:.2f}"
+            return result
+        
+        # USDC.e has 6 decimals
+        amount_micro = int(amount_usdc * 1_000_000)
+        
+        # ERC20 transfer(address to, uint256 amount)
+        transfer_data = (
+            "0xa9059cbb"
+            + to_addr[2:].lower().zfill(64)
+            + hex(amount_micro)[2:].zfill(64)
+        )
+        
+        USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        
+        relay_client = wallet.create_relay_client(private_key)
+        
+        from py_builder_relayer_client.models import SafeTransaction
+        try:
+            from py_builder_relayer_client.models import OperationType
+            op_call = OperationType.Call
+        except ImportError:
+            try:
+                from py_builder_relayer_client import OperationType
+                op_call = OperationType.Call
+            except ImportError:
+                class _OpCall:
+                    value = 0
+                op_call = _OpCall()
+        
+        tx = SafeTransaction(
+            to=USDC_E,
+            data=transfer_data,
+            value="0",
+            operation=op_call,
+        )
+        
+        response = relay_client.execute([tx], "USDC withdrawal")
+        
+        tx_hash = None
+        if hasattr(response, "wait"):
+            res = response.wait()
+            if res:
+                tx_hash = getattr(res, "transactionHash", None) or getattr(res, "transaction_hash", None)
+        elif isinstance(response, dict):
+            tx_hash = response.get("transactionHash") or response.get("transaction_hash")
+        
+        result["success"] = True
+        result["tx_hash"] = str(tx_hash) if tx_hash else "submitted"
+        logger.info(f"  💸 Withdrawal: ${amount_usdc:.2f} → {to_address[:10]}... tx={result['tx_hash']}")
+        
+    except ValueError:
+        result["error"] = "Invalid wallet address"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+        logger.error(f"  ❌ Withdrawal error: {result['error']}")
+    
+    return result
