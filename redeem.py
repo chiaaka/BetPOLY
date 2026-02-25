@@ -14,10 +14,11 @@ CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 
 
-def _encode_redeem(condition_id: str, neg_risk: bool) -> dict:
-    """Build redeem transaction as plain dict."""
+def _encode_redeem(condition_id: str, neg_risk: bool) -> "SafeTransaction":
+    """Build redeem transaction as SafeTransaction for relayer."""
     from web3 import Web3
     from eth_abi import encode
+    from py_builder_relayer_client.models import SafeTransaction
 
     cond_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
 
@@ -32,7 +33,11 @@ def _encode_redeem(condition_id: str, neg_risk: bool) -> dict:
         ],
     )
     target = NEG_RISK_ADAPTER if neg_risk else CTF
-    return {"to": target, "data": "0x" + fn_sig.hex() + args.hex(), "value": "0"}
+    return SafeTransaction(
+        to=target,
+        data="0x" + fn_sig.hex() + args.hex(),
+        value="0",
+    )
 
 
 async def redeem_position(
