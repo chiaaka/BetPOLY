@@ -1138,6 +1138,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data[f"g_{league}"] = [g]
             info = LEAGUES.get(league, {"name": "Today", "emoji": "📅"})
             text = f"{info['emoji']} {info['name']}\n\n{format_match(g, cur)}"
+            thin_sports = {"esports", "table-tennis", "darts", "cricket"}
+            sport = g.get("sport", "")
+            if sport in thin_sports:
+                text += "\n⚠️ <i>Low liquidity market — odds may shift on fill</i>"
             await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_game_odds(g, 0, league))
     
     elif d == "sport_soccer":
@@ -1943,6 +1947,12 @@ async def _show_game(q, league: str, idx: int, cur: str, ctx):
     g = games[idx]
     info = LEAGUES.get(league, {"name": league, "emoji": "🏟"})
     text = f"{info['emoji']} {info['name']}\n\n{format_match(g, cur)}"
+    
+    # Warn on known low-liquidity sports
+    thin_sports = {"esports", "table-tennis", "darts", "cricket"}
+    sport = g.get("sport", "")
+    if sport in thin_sports or (g.get("live") and sport not in {"soccer", "basketball", "football", "tennis", "baseball", "hockey", "mma"}):
+        text += "\n⚠️ <i>Low liquidity market — odds may shift on fill</i>"
     
     await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_game_odds(g, idx, league))
 
